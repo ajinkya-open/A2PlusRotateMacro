@@ -1,0 +1,302 @@
+from PySide import QtGui, QtCore
+import FreeCAD as App
+import FreeCADGui as Gui
+
+class RotatePartUI(QtGui.QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("A2plus Rotate Around Axis")
+        self.setMinimumWidth(500)
+        self.part_obj = None
+        self.axis_dir = None
+        self.axis_point = None
+        self.base_placement = None
+        self.current_angle = 0.0
+        self.auto_timer = None
+        self.auto_speed = 70  # degrees per second
+
+        self.init_ui()
+
+        # Try to auto-detect current selection
+        self.update_selection_from_current()
+
+        # Register selection observer
+        Gui.Selection.addObserver(self)
+
+    def init_ui(self):
+        main_layout = QtGui.QVBoxLayout()
+
+        # Instruction box
+        instructions = QtGui.QLabel(
+            "1. Select the part to rotate (click its name in tree or body in 3D).\n"
+            "2. Select the cylindrical face or circular edge of the rod (Ctrl+click).\n"
+            "3. Use the slider or spinbox to rotate.\n"
+            "The A2plus solver will keep all constraints satisfied."
+        )
+        instructions.setWordWrap(True)
+        main_layout.addWidget(instructions)
+
+        # Status display
+        self.status_part = QtGui.QLabel("Part: not selected")
+        self.status_axis = QtGui.QLabel("Axis: not selected")
+        self.status_solver = QtGui.QLabel("Solver: ready")
+        main_layout.addWidget(self.status_part)
+        main_layout.addWidget(self.status_axis)
+        main_layout.addWidget(self.status_solver)
+
+        separator1 = QtGui.QFrame()
+        separator1.setFrameShape(QtGui.QFrame.HLine)
+        main_layout.addWidget(separator1)
+
+        # Angle controls
+        angle_layout = QtGui.QHBoxLayout()
+        angle_layout.addWidget(QtGui.QLabel("Angle:"))
+        self.slider = QtGui.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setRange(0, 360)
+        self.slider.setSingleStep(1)
+        self.slider.setPageStep(5)
+        angle_layout.addWidget(self.slider)
+
+        self.spinbox = QtGui.QDoubleSpinBox()
+        self.spinbox.setRange(0, 360)
+        self.spinbox.setSingleStep(1)
+        self.spinbox.setDecimals(1)
+        self.spinbox.setSuffix("°")
+        angle_layout.addWidget(self.spinbox)
+
+        main_layout.addLayout(angle_layout)
+
+        # Reset button
+        btn_reset = QtGui.QPushButton("Reset Angle to 0")
+        btn_reset.clicked.connect(self.reset_angle)
+        main_layout.addWidget(btn_reset)
+
+        separator2 = QtGui.QFrame()
+        separator2.setFrameShape(QtGui.QFrame.HLine)
+        main_layout.addWidget(separator2)
+
+        # Auto-rotate controls
+        auto_layout = QtGui.QHBoxLayout()
+        self.auto_checkbox = QtGui.QCheckBox("Auto Rotate")
+        auto_layout.addWidget(self.auto_checkbox)
+
+        auto_layout.addWidget(QtGui.QLabel("Speed:"))
+        self.speed_slider = QtGui.QSlider(QtCore.Qt.Horizontal)
+        self.speed_slider.setRange(1, 50)
+        self.speed_slider.setValue(self.auto_speed)
+        self.speed_slider.setSingleStep(1)
+        auto_layout.addWidget(self.speed_slider)
+        self.speed_label = QtGui.QLabel(f"{self.auto_speed}°/s")
+        auto_layout.addWidget(self.speed_label)
+
+        main_layout.addLayout(auto_layout)
+
+        self.auto_checkbox.toggled.connect(self.toggle_auto_rotate)
+        self.speed_slider.valueChanged.connect(self.speed_changed)
+
+        separator3 = QtGui.QFrame()
+        separator3.setFrameShape(QtGui.QFrame.HLine)
+        main_layout.addWidget(separator3)
+
+        # Close button
+        btn_close = QtGui.QPushButton("Close")
+        btn_close.clicked.connect(self.close_dialog)
+        main_layout.addWidget(btn_close)
+
+        self.setLayout(main_layout)
+
+        # Connect slider and spinbox
+        self.slider.valueChanged.connect(self.slider_changed)
+        self.spinbox.valueChanged.connect(self.spinbox_changed)
+
+    # ---- Selection handling ----
+    def addSelection(self, doc, obj, sub, pnt):
+        self.update_selection_from_current()
+
+    def removeSelection(self, doc, obj, sub):
+        self.update_selection_from_current()
+
+    def update_selection_from_current(self):
+        """Update part and axis based on current selection."""
+        sel = Gui.Selection.getSelectionEx()
+        part = None
+        axis_dir = None
+        axis_point = None
+
+        # Look for part (selection without subobjects)
+        for s in sel:
+            if not s.HasSubObjects:
+                part = s.Object
+                break
+
+        # Look for axis (cylindrical face/edge)
+        for s in sel:
+            if s.HasSubObjects:
+                d, p = self.extract_axis_from_selection(s)
+                if d is not None:
+                    axis_dir = d
+                    axis_point = p
+                    break
+
+        # Update stored values and labels
+        self.part_obj = part
+        self.axis_dir = axis_dir
+        self.axis_point = axis_point
+
+        if self.part_obj:
+            self.status_part.setText(f"Part: {self.part_obj.Label}")
+            # Store base placement when part first selected (if not already stored)
+            if self.base_placement is None:
+                self.base_placement = self.part_obj.Placement
+        else:
+            self.status_part.setText("Part: not selected")
+            self.base_placement = None
+
+        if self.axis_dir is not None and self.axis_point is not None:
+            self.status_axis.setText("Axis: selected (cylindrical face/edge)")
+        else:
+            self.status_axis.setText("Axis: not selected")
+
+    def extract_axis_from_selection(self, sel):
+        """Extract axis direction and point from a selected cylindrical face or circular edge."""
+        if not sel.HasSubObjects:
+            return None, None
+        sub = sel.SubElementNames[0]
+        obj = sel.Object
+        try:
+            shape = getattr(obj.Shape, sub)
+        except Exception:
+            return None, None
+        # Face
+        if hasattr(shape, "Surface"):
+            surf = shape.Surface
+            if hasattr(surf, "Axis") and hasattr(surf, "Center"):
+                return surf.Axis, surf.Center
+        # Edge
+        if hasattr(shape, "Curve"):
+            curve = shape.Curve
+            if hasattr(curve, "Axis") and hasattr(curve, "Center"):
+                return curve.Axis, curve.Center
+        return None, None
+
+    # ---- Rotation operations ----
+    def rotate_part_by_delta(self, delta_deg):
+        """Rotate the selected part around the stored axis by delta_deg."""
+        if self.part_obj is None or self.axis_dir is None or self.axis_point is None:
+            self.status_solver.setText("Solver: missing part or axis")
+            return False
+
+        # If base_placement not set, use current placement as base
+        if self.base_placement is None:
+            self.base_placement = self.part_obj.Placement
+
+        # Create rotation object
+        rot_delta = App.Rotation(self.axis_dir, delta_deg)
+
+        # Apply rotation around axis_point
+        plm = self.part_obj.Placement
+        plm.Base = self.axis_point + rot_delta.multVec(plm.Base - self.axis_point)
+        plm.Rotation = rot_delta.multiply(plm.Rotation)
+        self.part_obj.Placement = plm
+
+        # Call A2plus solver
+        App.ActiveDocument.recompute()
+        try:
+            import a2p_solversystem
+            a2p_solversystem.solveConstraints(App.ActiveDocument, useTransaction=False)
+            self.status_solver.setText("Solver: constraints satisfied")
+        except Exception as e:
+            self.status_solver.setText(f"Solver error: {e}")
+            return False
+        App.ActiveDocument.recompute()
+        return True
+
+    def slider_changed(self, value):
+        # Update spinbox without recursion
+        self.spinbox.blockSignals(True)
+        self.spinbox.setValue(value)
+        self.spinbox.blockSignals(False)
+
+        # Compute delta from current_angle
+        delta = value - self.current_angle
+        if delta == 0:
+            return
+        self.current_angle = value
+        self.rotate_part_by_delta(delta)
+
+    def spinbox_changed(self, value):
+        # Update slider without recursion
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(round(value)))
+        self.slider.blockSignals(False)
+
+        # Compute delta
+        delta = value - self.current_angle
+        if delta == 0:
+            return
+        self.current_angle = value
+        self.rotate_part_by_delta(delta)
+
+    def reset_angle(self):
+        """Rotate back to initial angle (0)."""
+        if self.current_angle == 0:
+            return
+        delta = -self.current_angle
+        self.current_angle = 0
+        self.rotate_part_by_delta(delta)
+
+        # Update controls
+        self.slider.blockSignals(True)
+        self.slider.setValue(0)
+        self.slider.blockSignals(False)
+        self.spinbox.blockSignals(True)
+        self.spinbox.setValue(0)
+        self.spinbox.blockSignals(False)
+
+    # ---- Auto rotate ----
+    def toggle_auto_rotate(self, checked):
+        if checked:
+            if self.auto_timer is None:
+                self.auto_timer = QtCore.QTimer()
+                self.auto_timer.timeout.connect(self.auto_rotate_step)
+            self.auto_timer.start(100)  # 100 ms
+        else:
+            if self.auto_timer:
+                self.auto_timer.stop()
+
+    def speed_changed(self, val):
+        self.auto_speed = val
+        self.speed_label.setText(f"{val}°/s")
+
+    def auto_rotate_step(self):
+        # Calculate delta for 100 ms
+        delta = self.auto_speed * 0.1  # degrees per 100 ms
+        # Apply rotation
+        if self.rotate_part_by_delta(delta):
+            # Update current_angle and controls
+            self.current_angle += delta
+            if self.current_angle >= 360:
+                self.current_angle -= 360
+            # Update slider/spinbox without triggering signals
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(round(self.current_angle)))
+            self.slider.blockSignals(False)
+            self.spinbox.blockSignals(True)
+            self.spinbox.setValue(self.current_angle)
+            self.spinbox.blockSignals(False)
+
+    def close_dialog(self):
+        # Remove observer and close
+        Gui.Selection.removeObserver(self)
+        if self.auto_timer:
+            self.auto_timer.stop()
+        self.close()
+
+# Main
+if __name__ == "__main__":
+    # Check if there's an open document
+    if App.ActiveDocument is None:
+        QtGui.QMessageBox.warning(None, "A2plus Rotate", "No active document.")
+    else:
+        dlg = RotatePartUI()
+        dlg.show()  # non-modal
